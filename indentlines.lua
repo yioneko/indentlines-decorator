@@ -202,26 +202,23 @@ local function find_cursor_scope(bufnr, clnum)
 		local next_indent = buf_state.indents[clnum + 1] or 0
 		local cur_indent = buf_state.indents[clnum]
 
-		if
-			prev_indent < cur_indent
-			or next_indent < cur_indent
-			or (prev_indent == cur_indent and next_indent == cur_indent)
-		then
+		if prev_indent <= cur_indent and next_indent <= cur_indent then
 			-- case 1:
-			-- prev      or ...cur <-
-			-- ...cur <-    next <-
+			-- prev
+			-- ...cur
+			-- next
 			base_line, base_line_indent = clnum, cur_indent
-		elseif next_indent <= prev_indent and next_indent >= cur_indent then
+		elseif (next_indent <= prev_indent and next_indent > cur_indent) or prev_indent <= cur_indent then
 			-- case 2:
-			-- ......prev
-			-- cur
-			-- ...next <-
+			-- ......prev or prev
+			-- cur           ...cur
+			-- ...next <-    ......next <-
 			base_line, base_line_indent = clnum + 1, next_indent
 		elseif prev_indent >= cur_indent then
 			-- case 3:
-			-- ...prev <-
-			-- cur
-			-- ......next
+			-- ...prev <- or ......prev <-
+			-- cur           ...cur
+			-- ......next    next
 			base_line, base_line_indent = clnum - 1, prev_indent
 		end
 	end
