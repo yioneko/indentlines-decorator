@@ -14,10 +14,10 @@ M.status = "pre_setup"
 ---@field char string
 ---@field char_hl string
 ---@field show_cursor_scope boolean
----@field cursor_scope_char_hl string
+---@field cursor_scope_char_hl? string
 ---@field auto_clear_cursor_scope boolean
 ---@field priority number
----@field max_indent_level number
+---@field max_increase_level number
 
 ---@class IndentGuideGlobalOpts: IndentGuideOpts
 ---@field get_opts? fun(bufnr:number):IndentGuideOpts?
@@ -45,14 +45,14 @@ local global_opts = {
 	enabled = false,
 	shiftwidth = vim.o.shiftwidth,
 	overscan = 100,
+	skip_first_indent = false,
 	char = "▏",
-	skip_first_indent = true,
-	char_hl = "FoldColumn",
+	char_hl = "LineNr",
 	show_cursor_scope = true,
 	cursor_scope_char_hl = "Delimiter",
 	auto_clear_cursor_scope = true,
 	priority = 120,
-	max_indent_level = 100,
+	max_increase_level = 1,
 }
 
 local function first_no_nil(...)
@@ -61,6 +61,10 @@ local function first_no_nil(...)
 			return v
 		end
 	end
+end
+
+local function round_indent(indent, shiftwidth)
+	return math.floor(indent / shiftwidth) * shiftwidth
 end
 
 ---@param line string
@@ -125,7 +129,7 @@ local function get_opts(bufnr)
 	o("cursor_scope_char_hl")
 	o("auto_clear_cursor_scope")
 	o("priority")
-	o("max_indent_level")
+	o("max_increase_level")
 
 	return opts
 end
@@ -146,7 +150,7 @@ end
 ---@return number, number?
 local function find_contain_line(bufnr, lnum, state_key, increment)
 	local state = buf_decoration_state[bufnr]
-	local cur_indent = state.indents[lnum]
+	local cur_indent = get_indent(bufnr, lnum)
 	if not cur_indent then
 		-- TODO: how to deal with this?
 		return lnum, cur_indent
@@ -198,9 +202,8 @@ local function find_indent_scope(bufnr, lnum)
 	local prev_lnum, prev_indent = find_prev_contain_lnum(bufnr, lnum)
 	local next_lnum, next_indent = find_next_contain_lnum(bufnr, lnum)
 
-	local state = buf_decoration_state[bufnr]
 	-- blank line: refind indent scope
-	if state.indents[lnum] == math.huge then
+	if get_indent(bufnr, lnum) == math.huge then
 		if prev_indent and next_indent then
 			if prev_indent >= next_indent then
 				return find_indent_scope(bufnr, prev_lnum)
@@ -255,44 +258,60 @@ local function find_cursor_scope(bufnr, clnum)
 		if not prev_indent and not next_indent then
 			return
 		end
+
+		local shiftwidth = buf_state.opts.shiftwidth
+		-- check max_increase_level
+		if prev_indent and prev_indent + buf_state.opts.max_increase_level * shiftwidth < base_line_indent then
+			return {
+				slnum = prev_lnum + 1,
+				-- Since we prefer prev_indent as higlighted indent level, we should include next_lnum as indent scope
+				elnum = next_lnum,
+				indent = round_indent(prev_indent, shiftwidth),
+			}
+		end
+
 		return {
 			slnum = prev_lnum + 1,
 			elnum = next_lnum - 1,
-			-- This is likely: prev
-			--                 .........|...base
-			--                 next
-			-- thus we should use base_line_indent as the highlighed indent level
-			-- still need to check blank line here
-			indent = base_line_indent < math.huge and math.max(base_line_indent - buf_state.opts.shiftwidth, 0)
-				or math.max(prev_indent or 0, next_indent or 0),
+			indent = round_indent(
+				-- still need to check blank line here
+				base_line_indent == math.huge and next_indent or math.max(0, base_line_indent - 0.5), -- round base_line_indent to nearest indent level
+				shiftwidth
+			),
 		}
 	end
 end
 
-local function redraw_cursor_scope(winnr, bufnr, clnum)
+local function redraw_cursor_scope(winnr, bufnr, new_scope)
 	local win_state = win_decoration_state[winnr]
-
 	local prev_scope = win_state.cursor_scope
-	local new_scope = find_cursor_scope(bufnr, clnum)
 	win_state.cursor_scope = new_scope
 
-	if new_scope then
+	if new_scope and prev_scope then
 		-- The two ranges are unlikely to intersect, only contain or not contain), try to reduce number of redrawed lines here
-		if prev_scope then
-			if prev_scope.elnum <= new_scope.slnum or prev_scope.slnum >= new_scope.elnum then
-				vim.api.nvim__buf_redraw_range(bufnr, prev_scope.slnum, prev_scope.elnum + 1)
-				vim.api.nvim__buf_redraw_range(bufnr, new_scope.slnum, new_scope.elnum + 1)
-			else
-				vim.api.nvim__buf_redraw_range(
-					bufnr,
-					math.min(new_scope.slnum, prev_scope.slnum),
-					math.max(new_scope.elnum, prev_scope.elnum) + 1
-				)
-			end
-		else
-			vim.api.nvim__buf_redraw_range(bufnr, new_scope.slnum, new_scope.elnum + 1)
+		if
+			prev_scope.slnum == new_scope.slnum
+			and prev_scope.elnum == new_scope.elnum
+			and prev_scope.indent == new_scope.indent
+		then
+			-- fast path: scope not changed, no need to redraw
+			return
 		end
+
+		if prev_scope.elnum <= new_scope.slnum or prev_scope.slnum >= new_scope.elnum then
+			vim.api.nvim__buf_redraw_range(bufnr, prev_scope.slnum, prev_scope.elnum + 1)
+			vim.api.nvim__buf_redraw_range(bufnr, new_scope.slnum, new_scope.elnum + 1)
+		else
+			vim.api.nvim__buf_redraw_range(
+				bufnr,
+				math.min(new_scope.slnum, prev_scope.slnum),
+				math.max(new_scope.elnum, prev_scope.elnum) + 1
+			)
+		end
+	elseif new_scope then
+		vim.api.nvim__buf_redraw_range(bufnr, new_scope.slnum, new_scope.elnum + 1)
 	elseif prev_scope then
+		-- redraw to clear highlight
 		vim.api.nvim__buf_redraw_range(bufnr, prev_scope.slnum, prev_scope.elnum + 1)
 	end
 end
@@ -301,14 +320,8 @@ end
 ---@param bufnr number
 ---@param lnum number
 ---@return number
-local function get_displayed_indent(bufnr, lnum)
-	local state = buf_decoration_state[bufnr]
+local function get_display_indent(bufnr, lnum)
 	local cur_indent = get_indent(bufnr, lnum)
-	-- botline guess is wrong
-	if cur_indent == nil then
-		update_lines(bufnr, lnum, lnum + state.opts.overscan)
-		cur_indent = get_indent(bufnr, lnum)
-	end
 
 	if cur_indent == math.huge then
 		local _, next_indent = find_next_contain_lnum(bufnr, lnum)
@@ -318,18 +331,18 @@ local function get_displayed_indent(bufnr, lnum)
 			return 0
 		end
 	else
-		return cur_indent
+		local _, prev_indent = find_prev_contain_lnum(bufnr, lnum)
+		return math.min(
+			(prev_indent or math.huge)
+				+ buf_decoration_state[bufnr].opts.shiftwidth * buf_decoration_state[bufnr].opts.max_increase_level,
+			cur_indent or 0
+		)
 	end
 end
 
 local function on_line(_, winnr, bufnr, lnum)
-	if not buf_decoration_state[bufnr] then
-		return
-	end
-
 	local buf_state = buf_decoration_state[bufnr]
-
-	if not buf_state.opts.enabled then
+	if not buf_state or not buf_state.opts.enabled then
 		return
 	end
 
@@ -340,8 +353,15 @@ local function on_line(_, winnr, bufnr, lnum)
 
 	local leftcol = win_state.view.leftcol
 
-	local indent = math.min(get_displayed_indent(bufnr, lnum), buf_state.opts.max_indent_level * shiftwidth)
-	local is_blank_line = get_indent(bufnr, lnum) == math.huge
+	local indent = get_indent(bufnr, lnum)
+	-- botline guess is wrong
+	if indent == nil then
+		update_lines(bufnr, lnum, lnum + buf_state.opts.overscan)
+		indent = get_indent(bufnr, lnum)
+	end
+
+	local is_blank_line = indent == math.huge
+	local displayed_indent = get_display_indent(bufnr, lnum)
 
 	local in_cursor_scope = buf_state.opts.show_cursor_scope
 		and win_state.cursor_scope
@@ -349,18 +369,20 @@ local function on_line(_, winnr, bufnr, lnum)
 		and lnum <= win_state.cursor_scope.elnum
 	do
 		local guide_col = 0
-		if skip_first_indent or (is_blank_line and indent == 0) then
+		if skip_first_indent or (is_blank_line and displayed_indent == 0) then
 			guide_col = shiftwidth
 		end
+		-- round up
+		guide_col = math.max(guide_col, round_indent(leftcol + shiftwidth - 1, shiftwidth))
 
-		while (is_blank_line and guide_col <= indent) or guide_col < indent do
+		while (is_blank_line and guide_col <= displayed_indent) or guide_col < displayed_indent do
 			local is_cursor_scope_guide = in_cursor_scope and guide_col == win_state.cursor_scope.indent
 			local hl = is_cursor_scope_guide and buf_state.opts.cursor_scope_char_hl or buf_state.opts.char_hl
 
 			vim.api.nvim_buf_set_extmark(bufnr, ns, lnum, 0, {
 				virt_text = { { buf_state.opts.char, hl } },
 				virt_text_pos = "overlay",
-				virt_text_win_col = guide_col + leftcol,
+				virt_text_win_col = guide_col - leftcol,
 				hl_mode = "combine",
 				priority = buf_state.opts.priority,
 				ephemeral = true,
@@ -409,10 +431,11 @@ local function on_win(_, winnr, bufnr, topline, botline)
 	end
 	win_decoration_state[winnr].view = vim.api.nvim_win_call(winnr, vim.fn.winsaveview)
 
-	local win_state = win_decoration_state[winnr]
-
 	local start_lnum = math.max(0, topline - 1 - buf_opts.overscan)
 	local end_lnum = botline + buf_opts.overscan
+	-- prefetch lines before on_line: this is more efficient than fetching line one by one, but
+	-- might fetch redundant lines because of fold ranges
+	-- TODO: batch fetch in on_line
 	update_lines(bufnr, start_lnum, end_lnum)
 
 	local cur_win = vim.api.nvim_get_current_win()
@@ -420,26 +443,20 @@ local function on_win(_, winnr, bufnr, topline, botline)
 		local cursor = vim.api.nvim_win_get_cursor(cur_win)
 		local clnum = cursor[1] - 1
 
+		-- botline guess is wrong
 		if clnum >= botline then
 			update_lines(bufnr, clnum, clnum + buf_opts.overscan)
 		end
 
 		if buf_opts.show_cursor_scope then
-			redraw_cursor_scope(winnr, bufnr, clnum)
+			local new_scope = find_cursor_scope(bufnr, clnum)
+			redraw_cursor_scope(winnr, bufnr, new_scope)
 		else
 			-- clear on toggled
-			local prev_scope = win_state.cursor_scope
-			if prev_scope then
-				win_state.cursor_scope = nil
-				vim.api.nvim__buf_redraw_range(bufnr, prev_scope.slnum, prev_scope.elnum + 1)
-			end
+			redraw_cursor_scope(winnr, bufnr, nil)
 		end
 	elseif buf_opts.auto_clear_cursor_scope or not buf_opts.show_cursor_scope then
-		local prev_scope = win_state.cursor_scope
-		if prev_scope then
-			win_state.cursor_scope = nil
-			vim.api.nvim__buf_redraw_range(bufnr, prev_scope.slnum, prev_scope.elnum + 1)
-		end
+		redraw_cursor_scope(winnr, bufnr, nil)
 	end
 end
 
